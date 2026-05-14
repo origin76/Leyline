@@ -1,4 +1,5 @@
 pub type Var = u32;
+pub type ClauseId = u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Lit {

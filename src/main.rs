@@ -19,7 +19,7 @@ fn main() {
         process::exit(1);
     });
 
-    match leyline::solver::solve(&cnf) {
+    match leyline::solver::solve(cnf) {
         leyline::solver::SolveResult::Sat => println!("SAT"),
         leyline::solver::SolveResult::Unsat => println!("UNSAT"),
     }

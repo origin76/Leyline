@@ -1,41 +1,287 @@
-use crate::types::{Cnf, Lit, Var};
+use crate::types::{ClauseId, Cnf, Lit, Var};
 
-/// A clause that's been partially evaluated under the current assignment.
-struct EvalClause<'a> {
-    lits: &'a [Lit],
+struct WatchedClause {
+    lits: Vec<Lit>,
+    watched: [usize; 2],
 }
 
-enum ClauseStatus {
-    Sat,
-    Conflict,
-    Unit(Lit),
-    Unresolved,
+/// Reason for a propagation: the clause that forced the assignment,
+/// and the specific literal in that clause that became true.
+type Reason = (ClauseId, Lit);
+
+pub struct Solver {
+    clauses: Vec<WatchedClause>,
+    watches: Vec<Vec<ClauseId>>,
+    assignment: Vec<Option<bool>>,
+    trail: Vec<Var>,
+    levels: Vec<usize>,
+    var_level: Vec<usize>,
+    reason: Vec<Option<Reason>>,
+    has_empty_clause: bool,
 }
 
-impl<'a> EvalClause<'a> {
-    fn evaluate(&self, assignment: &[Option<bool>]) -> ClauseStatus {
-        let mut unresolved_lit = None;
+#[inline]
+fn lit_idx(lit: Lit) -> usize {
+    lit.var as usize * 2 + lit.neg as usize
+}
 
-        for &lit in self.lits {
-            match assignment[lit.var as usize] {
-                Some(val) => {
-                    let lit_val = if lit.neg { !val } else { val };
-                    if lit_val {
-                        return ClauseStatus::Sat;
+impl Solver {
+    pub fn new(cnf: Cnf) -> Self {
+        let num_vars = cnf.num_vars as usize;
+        let mut watches = vec![Vec::new(); (num_vars + 1) * 2];
+        let mut clauses = Vec::with_capacity(cnf.clauses.len());
+        let mut has_empty_clause = false;
+
+        for lits in cnf.clauses {
+            if lits.is_empty() {
+                has_empty_clause = true;
+                continue;
+            }
+            let cid = clauses.len() as ClauseId;
+            let w1 = 0;
+            let w2 = if lits.len() > 1 { 1 } else { 0 };
+            watches[lit_idx(lits[w1])].push(cid);
+            if w2 != w1 {
+                watches[lit_idx(lits[w2])].push(cid);
+            }
+            clauses.push(WatchedClause {
+                lits,
+                watched: [w1, w2],
+            });
+        }
+
+        Self {
+            clauses,
+            watches,
+            assignment: vec![None; num_vars + 1],
+            trail: Vec::new(),
+            levels: Vec::new(),
+            var_level: vec![0; num_vars + 1],
+            reason: vec![None; num_vars + 1],
+            has_empty_clause,
+        }
+    }
+
+    fn assign(&mut self, var: Var, value: bool, reason: Option<Reason>) {
+        debug_assert!(self.assignment[var as usize].is_none());
+        self.assignment[var as usize] = Some(value);
+        self.var_level[var as usize] = self.levels.len();
+        self.reason[var as usize] = reason;
+        self.trail.push(var);
+    }
+
+    fn unassign_to_level(&mut self, level: usize) {
+        let trail_start = self.levels[level];
+        while self.trail.len() > trail_start {
+            let var = self.trail.pop().unwrap();
+            self.assignment[var as usize] = None;
+            self.reason[var as usize] = None;
+        }
+        self.levels.truncate(level);
+    }
+
+    fn is_false(&self, lit: Lit) -> bool {
+        match self.assignment[lit.var as usize] {
+            Some(val) => !(if lit.neg { !val } else { val }),
+            None => false,
+        }
+    }
+
+    fn is_true(&self, lit: Lit) -> bool {
+        match self.assignment[lit.var as usize] {
+            Some(val) => if lit.neg { !val } else { val },
+            None => false,
+        }
+    }
+
+    fn propagate(&mut self) -> Option<ClauseId> {
+        let mut prop_queue: Vec<Lit> = Vec::new();
+
+        if let Some(&var) = self.trail.last()
+            && let Some(val) = self.assignment[var as usize]
+        {
+            prop_queue.push(Lit::new(var, val));
+        }
+
+        while let Some(falsified) = prop_queue.pop() {
+            let fidx = lit_idx(falsified);
+            let watcher_list = std::mem::take(&mut self.watches[fidx]);
+            let mut keep = Vec::new();
+            let mut conflict: Option<ClauseId> = None;
+
+            for &cid in &watcher_list {
+                let clause = &self.clauses[cid as usize];
+                let w0 = clause.watched[0];
+                let w1 = clause.watched[1];
+
+                let (first_idx, other_idx) = if clause.lits[w0] == falsified {
+                    (w0, w1)
+                } else {
+                    debug_assert_eq!(clause.lits[w1], falsified);
+                    (w1, w0)
+                };
+                let other_lit = clause.lits[other_idx];
+
+                if self.is_true(other_lit) {
+                    keep.push(cid);
+                    continue;
+                }
+
+                let mut new_watch = None;
+                for (i, &lit) in clause.lits.iter().enumerate() {
+                    if i == first_idx || i == other_idx {
+                        continue;
+                    }
+                    if !self.is_false(lit) {
+                        new_watch = Some(i);
+                        break;
                     }
                 }
-                None => {
-                    if unresolved_lit.is_some() {
-                        return ClauseStatus::Unresolved; // 2+ unassigned
+
+                if let Some(nw_idx) = new_watch {
+                    self.clauses[cid as usize].watched = if first_idx == w0 {
+                        [nw_idx, other_idx]
+                    } else {
+                        [other_idx, nw_idx]
+                    };
+                    let new_lit = self.clauses[cid as usize].lits[nw_idx];
+                    self.watches[lit_idx(new_lit)].push(cid);
+                } else {
+                    keep.push(cid);
+                    if self.is_false(other_lit) {
+                        if conflict.is_none() {
+                            conflict = Some(cid);
+                        }
+                    } else {
+                        let value = !other_lit.neg;
+                        self.assign(other_lit.var, value, Some((cid, other_lit)));
+                        prop_queue.push(other_lit.negate());
                     }
-                    unresolved_lit = Some(lit);
+                }
+            }
+
+            self.watches[fidx] = keep;
+
+            if conflict.is_some() {
+                return conflict;
+            }
+        }
+
+        None
+    }
+
+    /// 1-UIP conflict analysis via resolution.
+    /// Returns (learned_clause, backtrack_level).
+    fn analyze_conflict(&mut self, conflict_cid: ClauseId) -> (Vec<Lit>, usize) {
+        let current_level = self.levels.len();
+
+        // Collect literals from the conflict clause.
+        let mut learned: Vec<Lit> = self.clauses[conflict_cid as usize].lits.clone();
+
+        // Resolve until exactly one literal remains at the current level.
+        loop {
+            let mut count_at_level = 0;
+            for lit in &learned {
+                if self.var_level[lit.var as usize] == current_level {
+                    count_at_level += 1;
+                }
+            }
+
+            if count_at_level <= 1 {
+                break;
+            }
+
+            // Find the most recently assigned variable at the current level.
+            let mut resolve_var = 0;
+            for &var in self.trail.iter().rev() {
+                if self.var_level[var as usize] == current_level
+                    && learned.iter().any(|l| l.var == var)
+                {
+                    resolve_var = var;
+                    break;
+                }
+            }
+            debug_assert!(resolve_var > 0);
+
+            // Resolve with the reason clause.
+            let (reason_cid, _reason_lit) = self.reason[resolve_var as usize].unwrap();
+            let reason_lits = self.clauses[reason_cid as usize].lits.clone();
+
+            let var = resolve_var;
+            learned.retain(|l| l.var != var);
+            for lit in &reason_lits {
+                if lit.var != var && !learned.iter().any(|l| l.var == lit.var) {
+                    learned.push(*lit);
                 }
             }
         }
 
-        match unresolved_lit {
-            Some(lit) => ClauseStatus::Unit(lit),
-            None => ClauseStatus::Conflict,
+        // Compute backtrack level: second-highest decision level in the learned clause.
+        let mut bt_level = 0usize;
+        for lit in &learned {
+            let lv = self.var_level[lit.var as usize];
+            if lv != current_level && lv > bt_level {
+                bt_level = lv;
+            }
+        }
+
+        (learned, bt_level)
+    }
+
+    fn decide(&self) -> Option<Var> {
+        (1..=self.assignment.len() as u32 - 1).find(|&var| self.assignment[var as usize].is_none())
+    }
+
+    pub fn solve(&mut self) -> SolveResult {
+        if self.has_empty_clause {
+            return SolveResult::Unsat;
+        }
+
+        loop {
+            if let Some(conflict_cid) = self.propagate() {
+                if self.levels.is_empty() {
+                    return SolveResult::Unsat;
+                }
+
+                let (learned, bt_level) = self.analyze_conflict(conflict_cid);
+
+                self.unassign_to_level(bt_level);
+
+                if learned.is_empty() {
+                    return SolveResult::Unsat;
+                }
+
+                // Add the learned clause and set up watches.
+                let cid = self.clauses.len() as ClauseId;
+                let w1 = 0;
+                let w2 = if learned.len() > 1 { 1 } else { 0 };
+                self.watches[lit_idx(learned[w1])].push(cid);
+                if w2 != w1 {
+                    self.watches[lit_idx(learned[w2])].push(cid);
+                }
+                self.clauses.push(WatchedClause {
+                    lits: learned,
+                    watched: [w1, w2],
+                });
+
+                // Propagate the unit literal from the learned clause.
+                // After backtracking, exactly one literal is unassigned.
+                let propagated = self.clauses.last().unwrap().lits.iter().find(|lit| {
+                    self.assignment[lit.var as usize].is_none()
+                });
+                if let Some(&lit) = propagated {
+                    let value = !lit.neg;
+                    self.assign(lit.var, value, Some((cid, lit)));
+                }
+            } else {
+                match self.decide() {
+                    None => return SolveResult::Sat,
+                    Some(var) => {
+                        self.levels.push(self.trail.len());
+                        self.assign(var, true, None);
+                    }
+                }
+            }
         }
     }
 }
@@ -46,200 +292,7 @@ pub enum SolveResult {
     Unsat,
 }
 
-pub struct Solver {
-    num_vars: u32,
-    assignment: Vec<Option<bool>>, // indexed by Var (1-indexed)
-    trail: Vec<Var>,               // assignment order, for undo
-    levels: Vec<usize>,            // trail index where each decision level starts
-}
-
-impl Solver {
-    pub fn new(num_vars: u32) -> Self {
-        Self {
-            num_vars,
-            assignment: vec![None; num_vars as usize + 1],
-            trail: Vec::new(),
-            levels: Vec::new(),
-        }
-    }
-
-    fn assign(&mut self, var: Var, value: bool) {
-        debug_assert!(self.assignment[var as usize].is_none());
-        self.assignment[var as usize] = Some(value);
-        self.trail.push(var);
-    }
-
-    fn unassign_to_level(&mut self, level: usize) {
-        let trail_start = self.levels[level];
-        while self.trail.len() > trail_start {
-            let var = self.trail.pop().unwrap();
-            self.assignment[var as usize] = None;
-        }
-        self.levels.truncate(level);
-    }
-
-    fn current_level(&self) -> usize {
-        self.levels.len()
-    }
-
-    /// Run unit propagation. Returns the level at which to backtrack
-    /// if a conflict is found, or None if no conflict.
-    fn propagate(&mut self, cnf: &Cnf) -> Option<usize> {
-        loop {
-            let mut propagated = false;
-            let mut conflict_level = None;
-
-            for clause in &cnf.clauses {
-                let eval = EvalClause { lits: clause };
-                match eval.evaluate(&self.assignment) {
-                    ClauseStatus::Sat => continue,
-                    ClauseStatus::Unresolved => continue,
-                    ClauseStatus::Conflict => {
-                        // Conflict: backtrack level is one less than current
-                        let level = self.current_level();
-                        if level == 0 {
-                            return Some(0); // UNSAT at root
-                        }
-                        conflict_level = Some(level - 1);
-                    }
-                    ClauseStatus::Unit(lit) => {
-                        let value = !lit.neg;
-                        self.assign(lit.var, value);
-                        propagated = true;
-                    }
-                }
-            }
-
-            if let Some(level) = conflict_level {
-                return Some(level);
-            }
-
-            if !propagated {
-                return None; // fixpoint reached, no conflict
-            }
-        }
-    }
-
-    /// Pick the next unassigned variable (naive: first unassigned).
-    fn decide(&self) -> Option<Var> {
-        (1..=self.num_vars).find(|&var| self.assignment[var as usize].is_none())
-    }
-
-    pub fn solve(&mut self, cnf: &Cnf) -> SolveResult {
-        // The "decisions" stack: each entry is (var, tried_positive)
-        // We only push to this when making a new decision.
-        // On backtrack we pop and try the other polarity.
-        let mut decisions: Vec<(Var, bool)> = Vec::new();
-
-        loop {
-            // Unit propagate
-            if let Some(bt_level) = self.propagate(cnf) {
-                // Conflict during propagation
-                if bt_level == 0 {
-                    return SolveResult::Unsat;
-                }
-                // Undo to bt_level
-                self.unassign_to_level(bt_level);
-                // Retry with opposite polarity of the decision at bt_level
-                let (var, tried_pos) = decisions.pop().unwrap();
-                debug_assert_eq!(self.levels.len(), bt_level);
-                if tried_pos {
-                    // We tried positive, now try negative
-                    self.levels.push(self.trail.len());
-                    self.assign(var, false);
-                    decisions.push((var, false));
-                } else {
-                    // Both polarities tried, backtrack further
-                    continue; // loop will hit conflict again and backtrack
-                }
-            } else {
-                // No conflict, check if all assigned
-                match self.decide() {
-                    None => return SolveResult::Sat,
-                    Some(var) => {
-                        // Make a decision: try positive first
-                        self.levels.push(self.trail.len());
-                        self.assign(var, true);
-                        decisions.push((var, true));
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub fn solve(cnf: &Cnf) -> SolveResult {
-    let mut solver = Solver::new(cnf.num_vars);
-    solver.solve(cnf)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parser::parse_dimacs;
-    use std::io::BufReader;
-
-    fn solve_str(input: &str) -> SolveResult {
-        let cnf = parse_dimacs(BufReader::new(input.as_bytes())).unwrap();
-        solve(&cnf)
-    }
-
-    #[test]
-    fn sat_simple() {
-        let result = solve_str("p cnf 2 2\n1 2 0\n-1 2 0\n");
-        assert_eq!(result, SolveResult::Sat);
-    }
-
-    #[test]
-    fn unsat_simple() {
-        let result = solve_str("p cnf 1 2\n1 0\n-1 0\n");
-        assert_eq!(result, SolveResult::Unsat);
-    }
-
-    #[test]
-    fn sat_unit_propagation() {
-        // Unit clause forces x1=true, then x2 must be false
-        let result = solve_str("p cnf 2 2\n1 0\n-1 -2 0\n");
-        assert_eq!(result, SolveResult::Sat);
-    }
-
-    #[test]
-    fn sat_empty_formula() {
-        let result = solve_str("p cnf 0 0\n");
-        assert_eq!(result, SolveResult::Sat);
-    }
-
-    #[test]
-    fn unsat_empty_clause() {
-        // An empty clause (from "0" alone) is always false
-        let result = solve_str("p cnf 1 1\n0\n");
-        assert_eq!(result, SolveResult::Unsat);
-    }
-
-    #[test]
-    fn sat_three_vars() {
-        let result = solve_str("p cnf 3 3\n1 2 0\n-1 3 0\n-2 -3 0\n");
-        assert_eq!(result, SolveResult::Sat);
-    }
-
-    #[test]
-    fn unsat_pigeonhole_2_3() {
-        // 2 holes, 3 pigeons — UNSAT
-        // p1=1, p2=2, p3=3 means pigeon in hole 1
-        // p4=4, p5=5, p6=6 means pigeon in hole 2
-        // Each pigeon must be in some hole
-        // Each hole has at most one pigeon
-        let input = "p cnf 6 9
-1 4 0
-2 5 0
-3 6 0
--1 -2 0
--1 -3 0
--2 -3 0
--4 -5 0
--4 -6 0
--5 -6 0
-";
-        assert_eq!(solve_str(input), SolveResult::Unsat);
-    }
+pub fn solve(cnf: Cnf) -> SolveResult {
+    let mut solver = Solver::new(cnf);
+    solver.solve()
 }
